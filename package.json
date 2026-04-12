@@ -1,0 +1,56 @@
+{
+  "name": "pdf-assistant",
+  "version": "1.0.0",
+  "description": "A free, easy-to-use desktop app for editing PDFs — no internet connection or subscription required",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder",
+    "test": "node tests/pdf-operations.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ssharma-glaciercell/pdf-assistant.git"
+  },
+  "keywords": ["pdf", "editor", "desktop", "electron", "offline"],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/ssharma-glaciercell/pdf-assistant/issues"
+  },
+  "homepage": "https://github.com/ssharma-glaciercell/pdf-assistant#readme",
+  "build": {
+    "appId": "com.pdf-assistant.app",
+    "productName": "PDF Assistant",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*",
+      "node_modules/pdfjs-dist/build/**/*",
+      "node_modules/pdf-lib/es/**/*"
+    ],
+    "linux": {
+      "target": "AppImage",
+      "category": "Office"
+    },
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.productivity"
+    },
+    "win": {
+      "target": "nsis"
+    }
+  },
+  "dependencies": {
+    "electron": "^41.2.0",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^5.6.205"
+  },
+  "devDependencies": {
+    "electron-builder": "^26.8.1"
+  }
+}

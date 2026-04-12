@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; worker-src blob:;"
+  />
+  <title>PDF Assistant</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- Toolbar -->
+  <header id="toolbar">
+    <div class="toolbar-left">
+      <button id="btn-open" class="toolbar-btn" title="Open PDF (Ctrl+O)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M5 3h11l4 4v14H5V3z"/>
+          <polyline points="14 3 14 8 19 8"/>
+        </svg>
+        Open
+      </button>
+      <button id="btn-save" class="toolbar-btn" title="Save (Ctrl+S)" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/>
+          <polyline points="17 21 17 13 7 13 7 21"/>
+          <polyline points="7 3 7 8 15 8"/>
+        </svg>
+        Save
+      </button>
+      <button id="btn-save-as" class="toolbar-btn" title="Save As (Ctrl+Shift+S)" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/>
+          <polyline points="17 21 17 13 7 13 7 21"/>
+          <polyline points="7 3 7 8 15 8"/>
+          <line x1="12" y1="17" x2="12" y2="11"/>
+          <line x1="9" y1="14" x2="15" y2="14"/>
+        </svg>
+        Save As
+      </button>
+
+      <div class="separator"></div>
+
+      <button id="btn-add-text" class="toolbar-btn" title="Add Text Annotation" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M17 3a2.828 2.828 0 114 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>
+        </svg>
+        Add Text
+      </button>
+      <button id="btn-highlight" class="toolbar-btn toggle-btn" title="Highlight Tool" disabled>
+        <svg viewBox="0 0 24 24" fill="currentColor">
+          <path d="M15.232 5.232l3.536 3.536-9.193 9.193-3.536-3.536 9.193-9.193zm-10.364 12.95l1.415 1.415-2.829.707.707-2.829.707.707zm12.728-15.778a2 2 0 012.828 2.828L6.596 19.07l-4.243 1.06 1.061-4.242L17.596 2.404z"/>
+        </svg>
+        Highlight
+      </button>
+
+      <div class="separator"></div>
+
+      <button id="btn-rotate-cw" class="toolbar-btn" title="Rotate Page Clockwise" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="23 4 23 10 17 10"/>
+          <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/>
+        </svg>
+        Rotate
+      </button>
+      <button id="btn-delete-page" class="toolbar-btn" title="Delete Current Page" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="3 6 5 6 21 6"/>
+          <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a1 1 0 011-1h4a1 1 0 011 1v2"/>
+        </svg>
+        Delete Page
+      </button>
+      <button id="btn-merge" class="toolbar-btn" title="Merge another PDF into this one" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="12" y1="5" x2="12" y2="19"/>
+          <polyline points="19 12 12 19 5 12"/>
+        </svg>
+        Merge PDF
+      </button>
+    </div>
+
+    <div class="toolbar-center">
+      <button id="btn-prev" class="nav-btn" title="Previous Page" disabled>&#8249;</button>
+      <span id="page-info">—</span>
+      <button id="btn-next" class="nav-btn" title="Next Page" disabled>&#8250;</button>
+      <div class="zoom-controls">
+        <button id="btn-zoom-out" class="nav-btn" title="Zoom Out" disabled>−</button>
+        <span id="zoom-level">100%</span>
+        <button id="btn-zoom-in" class="nav-btn" title="Zoom In" disabled>+</button>
+        <button id="btn-zoom-fit" class="nav-btn" title="Fit to Width" disabled>Fit</button>
+      </div>
+    </div>
+
+    <div class="toolbar-right">
+      <span id="filename-display" class="filename"></span>
+    </div>
+  </header>
+
+  <!-- Main area -->
+  <div id="main-area">
+    <!-- Thumbnail sidebar -->
+    <aside id="sidebar">
+      <div id="thumbnail-list"></div>
+    </aside>
+
+    <!-- PDF canvas area -->
+    <main id="viewer-container">
+      <div id="welcome-screen">
+        <div class="welcome-content">
+          <svg class="welcome-icon" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 4h28l12 12v44H12V4z"/>
+            <polyline points="40 4 40 16 52 16"/>
+            <line x1="20" y1="28" x2="44" y2="28"/>
+            <line x1="20" y1="36" x2="44" y2="36"/>
+            <line x1="20" y1="44" x2="32" y2="44"/>
+          </svg>
+          <h2>PDF Assistant</h2>
+          <p>Open a PDF file to get started</p>
+          <button id="btn-welcome-open" class="primary-btn">Open PDF…</button>
+          <ul class="feature-list">
+            <li>✓ View and navigate PDFs</li>
+            <li>✓ Add text annotations</li>
+            <li>✓ Highlight content</li>
+            <li>✓ Rotate pages</li>
+            <li>✓ Delete pages</li>
+            <li>✓ Merge PDFs</li>
+            <li>✓ Works completely offline</li>
+            <li>✓ Free — no subscription needed</li>
+          </ul>
+        </div>
+      </div>
+      <div id="canvas-wrapper" style="display:none;">
+        <canvas id="pdf-canvas"></canvas>
+        <div id="annotation-layer"></div>
+      </div>
+
+      <!-- Text annotation popover -->
+      <div id="text-popover" class="popover" style="display:none;">
+        <textarea id="text-input" placeholder="Enter text…" rows="3"></textarea>
+        <div class="popover-actions">
+          <label>
+            Size:
+            <input type="number" id="font-size" value="14" min="6" max="72" style="width:50px;" />
+          </label>
+          <label>
+            Color:
+            <input type="color" id="font-color" value="#000000" />
+          </label>
+          <button id="text-confirm" class="primary-btn small">Add</button>
+          <button id="text-cancel" class="small">Cancel</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Status bar -->
+  <footer id="status-bar">
+    <span id="status-msg">Ready</span>
+  </footer>
+
+  <script src="../node_modules/pdfjs-dist/build/pdf.mjs" type="module"></script>
+  <script src="app.js" type="module"></script>
+</body>
+</html>
