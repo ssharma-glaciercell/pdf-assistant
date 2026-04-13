@@ -179,13 +179,6 @@ class PDFDocument:
             if progress_callback:
                 progress_callback(page_num + 1, len(self._doc))
 
-            buf = io.BytesIO()
-            overlay.save(buf, "PNG")
-            page.insert_image(page.rect, stream=buf.getvalue(), overlay=True)
-
-            if progress_callback:
-                progress_callback(page_num + 1, len(self._doc))
-
     # ------------------------------------------------------------------
     # Text annotation  (burned in)
     # ------------------------------------------------------------------
@@ -242,19 +235,54 @@ class PDFDocument:
         y: float,
         font_size: int = 24,
         color: Tuple[float, float, float] = (0.0, 0.0, 0.5),
+        fontname: str = "tiit",
+        fontfile: Optional[str] = None,
     ) -> None:
-        """Insert a typed signature (italic style via ZapDingbats fallback)."""
+        """Insert a typed signature with selectable font style."""
         if not self._doc:
             raise RuntimeError("No document open.")
         page = self._doc[page_index]
-        page.insert_text(
-            fitz.Point(x, y),
-            text,
-            fontsize=font_size,
-            color=color,
-            fontname="TiRo",  # Times-Roman italic-like
-            overlay=True,
-        )
+        insert_kwargs: dict = {
+            "fontsize": font_size,
+            "color": color,
+            "overlay": True,
+        }
+        if fontfile and Path(fontfile).exists():
+            insert_kwargs["fontfile"] = fontfile
+            insert_kwargs["fontname"] = Path(fontfile).stem.replace(" ", "_")
+        else:
+            insert_kwargs["fontname"] = fontname
+        page.insert_text(fitz.Point(x, y), text, **insert_kwargs)
+
+    # ------------------------------------------------------------------
+    # Pending overlays  (deferred burn-in at save time)
+    # ------------------------------------------------------------------
+
+    def apply_pending_overlays(self, overlays: list) -> None:
+        """Burn all deferred overlay items into the PDF content streams."""
+        if not self._doc:
+            raise RuntimeError("No document open.")
+        for ov in overlays:
+            page_idx = ov["page"]
+            if ov["type"] == "sig_image":
+                rect = (
+                    ov["pdf_x"],
+                    ov["pdf_y"],
+                    ov["pdf_x"] + ov["pdf_w"],
+                    ov["pdf_y"] + ov["pdf_h"],
+                )
+                self.add_signature_image(page_idx, ov["data"], rect)
+            elif ov["type"] == "sig_text":
+                self.add_signature_text(
+                    page_idx,
+                    ov["data"],
+                    ov["pdf_x"],
+                    ov["pdf_y"],
+                    font_size=ov.get("font_size", 24),
+                    color=ov.get("color", (0.0, 0.0, 0.5)),
+                    fontname=ov.get("fontname", "tiit"),
+                    fontfile=ov.get("fontfile"),
+                )
 
     # ------------------------------------------------------------------
     # Save  (flatten + optional password protection)

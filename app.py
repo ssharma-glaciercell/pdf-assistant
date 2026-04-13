@@ -32,6 +32,16 @@ SIG_CANVAS_W = 500
 SIG_CANVAS_H = 200
 SIG_PEN_WIDTH = 3
 
+# Signature font options: display name → (PyMuPDF built-in name, fontfile path or None)
+# fontfile paths are macOS-specific; missing files fall back to the built-in name.
+_SIG_FONTS: dict = {
+    "Classic Italic (Times)":       ("tiit", None),
+    "Elegant (Snell Roundhand)":    ("tiit", "/System/Library/Fonts/Supplemental/SnellRoundhand.ttc"),
+    "Handwritten (Bradley Hand)":   ("tiit", "/System/Library/Fonts/Supplemental/Bradley Hand Bold.ttf"),
+    "Oblique (Helvetica)":          ("heit", None),
+    "Italic Courier":               ("cobi", None),
+}
+
 
 # ---------------------------------------------------------------------------
 # Helper: PIL Image → PhotoImage (Tkinter-compatible)
@@ -51,44 +61,104 @@ class SignatureCanvas(tk.Canvas):
     def __init__(self, master, width=SIG_CANVAS_W, height=SIG_CANVAS_H, **kw):
         super().__init__(master, width=width, height=height,
                          bg="white", cursor="crosshair", **kw)
+        self._width = width
+        self._height = height
+        self._pen_color: str = "#000080"   # navy default
+        self._pen_width: int = SIG_PEN_WIDTH
+        # Each stroke: (hex_color, width, [(x0,y0), (x1,y1), ...])
+        self._strokes: list = []
+        self._current_pts: list = []
+        self._stroke_color: str = self._pen_color
+        self._stroke_width: int = self._pen_width
+
         self._img = Image.new("RGBA", (width, height), (255, 255, 255, 0))
         self._draw = ImageDraw.Draw(self._img)
         self._last: Optional[tuple[int, int]] = None
-        self._width = width
-        self._height = height
 
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<B1-Motion>", self._on_drag)
         self.bind("<ButtonRelease-1>", self._on_release)
 
+    # ---- pen properties ----
+
+    def set_pen_color(self, hex_color: str) -> None:
+        self._pen_color = hex_color
+
+    def set_pen_width(self, width: int) -> None:
+        self._pen_width = max(1, width)
+
+    # ---- drawing events ----
+
     def _on_press(self, event):
         self._last = (event.x, event.y)
+        self._current_pts = [(event.x, event.y)]
+        self._stroke_color = self._pen_color
+        self._stroke_width = self._pen_width
 
     def _on_drag(self, event):
         if self._last:
             x0, y0 = self._last
             x1, y1 = event.x, event.y
-            self.create_line(x0, y0, x1, y1, fill="navy",
-                             width=SIG_PEN_WIDTH, capstyle=tk.ROUND, smooth=True)
-            self._draw.line([x0, y0, x1, y1], fill=(0, 0, 128, 255),
-                            width=SIG_PEN_WIDTH)
+            self.create_line(x0, y0, x1, y1,
+                             fill=self._stroke_color,
+                             width=self._stroke_width,
+                             capstyle=tk.ROUND, smooth=True)
+            r, g, b = self._hex_to_rgb(self._stroke_color)
+            self._draw.line([x0, y0, x1, y1], fill=(r, g, b, 255),
+                            width=self._stroke_width)
             self._last = (x1, y1)
+            self._current_pts.append((x1, y1))
 
     def _on_release(self, _event):
+        if len(self._current_pts) > 1:
+            self._strokes.append(
+                (self._stroke_color, self._stroke_width, list(self._current_pts))
+            )
         self._last = None
+        self._current_pts = []
 
-    def clear(self):
+    # ---- undo / clear ----
+
+    def undo_last_stroke(self) -> None:
+        if self._strokes:
+            self._strokes.pop()
+            self._redraw_all()
+
+    def _redraw_all(self) -> None:
         self.delete("all")
         self._img = Image.new("RGBA", (self._width, self._height), (255, 255, 255, 0))
         self._draw = ImageDraw.Draw(self._img)
+        for hex_color, width, pts in self._strokes:
+            r, g, b = self._hex_to_rgb(hex_color)
+            fill = (r, g, b, 255)
+            for i in range(len(pts) - 1):
+                x0, y0 = pts[i]
+                x1, y1 = pts[i + 1]
+                self.create_line(x0, y0, x1, y1,
+                                 fill=hex_color, width=width,
+                                 capstyle=tk.ROUND, smooth=True)
+                self._draw.line([x0, y0, x1, y1], fill=fill, width=width)
+
+    def clear(self):
+        self._strokes.clear()
+        self._current_pts = []
+        self._redraw_all()
+
+    # ---- output ----
 
     def get_image(self) -> Image.Image:
         """Return the drawn signature as a PIL RGBA image."""
         return self._img.copy()
 
     def is_empty(self) -> bool:
-        extrema = self._img.convert("L").getextrema()
-        return extrema == (255, 255)
+        return len(self._strokes) == 0
+
+    # ---- helpers ----
+
+    @staticmethod
+    def _hex_to_rgb(hex_color: str) -> tuple:
+        h = hex_color.lstrip("#")
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
 
 
 # ---------------------------------------------------------------------------
@@ -109,11 +179,26 @@ class PDFAssistantApp(tk.Tk):
 
         # State for text placement mode
         self._text_placement_active: bool = False
-        self._text_color: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._text_color: tuple = (0.0, 0.0, 0.0)
 
         # State for signature placement
         self._sig_placement_active: bool = False
         self._pending_sig_img: Optional[Image.Image] = None
+
+        # Movable overlay system (deferred signature placement)
+        self._overlay_items: list = []
+        self._next_overlay_id: int = 0
+        self._overlay_photo_refs: dict = {}   # prevent PhotoImage GC
+        self._dragging_id: Optional[int] = None
+        self._drag_last_canvas: Optional[tuple] = None
+
+        # Typewriter mode
+        self._typewriter_active: bool = False
+
+        # Typed signature UI state (tk vars created before _build_ui)
+        self._typed_sig_font_var = tk.StringVar(value=list(_SIG_FONTS.keys())[0])
+        self._typed_sig_size = tk.IntVar(value=24)
+        self._typed_sig_color: tuple = (0.0, 0.0, 0.5)
 
         self._build_menu()
         self._build_ui()
@@ -192,6 +277,8 @@ class PDFAssistantApp(tk.Tk):
         v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self._page_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._page_canvas.bind("<Button-1>", self._on_canvas_click)
+        self._page_canvas.bind("<B1-Motion>", self._do_drag)
+        self._page_canvas.bind("<ButtonRelease-1>", self._end_drag)
 
     # ------------------------------------------------------------------
     # Watermark tab
@@ -333,12 +420,18 @@ class PDFAssistantApp(tk.Tk):
         ttk.Button(frame, text="Place Text on Page (click canvas)",
                    command=self._activate_text_placement).grid(row=4, column=0, columnspan=2, pady=6)
 
-        self._txt_status = ttk.Label(frame, text="", foreground="green")
-        self._txt_status.grid(row=5, column=0, columnspan=2)
+        ttk.Separator(frame, orient=tk.HORIZONTAL).grid(row=5, column=0, columnspan=2, sticky=tk.EW, pady=8)
 
-        ttk.Separator(frame, orient=tk.HORIZONTAL).grid(row=6, column=0, columnspan=2, sticky=tk.EW, pady=8)
-        ttk.Label(frame, text="Click the page preview\nafter pressing the button\nto place your text.",
-                  justify=tk.CENTER, foreground="gray").grid(row=7, column=0, columnspan=2)
+        ttk.Button(frame, text="✏  Typewriter Mode",
+                   command=self._activate_typewriter_mode).grid(row=6, column=0, columnspan=2, pady=4)
+        ttk.Button(frame, text="Stop Typewriter",
+                   command=self._stop_typewriter_mode).grid(row=7, column=0, columnspan=2, pady=2)
+
+        self._txt_status = ttk.Label(frame, text="", foreground="green")
+        self._txt_status.grid(row=8, column=0, columnspan=2, pady=4)
+
+        ttk.Label(frame, text="Click the page preview\nafter pressing a button\nto place your text.",
+                  justify=tk.CENTER, foreground="gray").grid(row=9, column=0, columnspan=2)
 
     def _pick_txt_color(self):
         init = "#{:02x}{:02x}{:02x}".format(
@@ -375,24 +468,69 @@ class PDFAssistantApp(tk.Tk):
         frame = ttk.Frame(self._notebook, padding=10)
         self._notebook.add(frame, text="Signature")
 
-        ttk.Label(frame, text="Draw your signature below:").pack(anchor=tk.W, pady=4)
+        # ---- Pen controls ----
+        pen_row = ttk.Frame(frame)
+        pen_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(pen_row, text="Pen:").pack(side=tk.LEFT)
+        self._sig_pen_color_hex = "#000080"
+        self._sig_pen_color_btn = tk.Button(
+            pen_row, text="  Colour  ", bg="#000080", fg="white",
+            command=self._pick_sig_pen_color)
+        self._sig_pen_color_btn.pack(side=tk.LEFT, padx=4)
+        ttk.Label(pen_row, text="Width:").pack(side=tk.LEFT, padx=(8, 0))
+        self._sig_pen_width = tk.IntVar(value=SIG_PEN_WIDTH)
+        self._sig_pen_width.trace_add("write", lambda *_: self._update_pen_width())
+        ttk.Spinbox(pen_row, from_=1, to=10, textvariable=self._sig_pen_width,
+                    width=4).pack(side=tk.LEFT, padx=4)
+
+        # ---- Drawing canvas ----
+        ttk.Label(frame, text="Draw your signature:").pack(anchor=tk.W, pady=(4, 2))
         self._sig_canvas = SignatureCanvas(frame, width=270, height=120)
         self._sig_canvas.pack(pady=4)
 
         btn_row = ttk.Frame(frame)
-        btn_row.pack(fill=tk.X, pady=4)
-        ttk.Button(btn_row, text="Clear", command=self._sig_canvas.clear).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_row, text="Place Drawn Signature",
-                   command=self._activate_drawn_sig).pack(side=tk.LEFT, padx=4)
+        btn_row.pack(fill=tk.X, pady=2)
+        ttk.Button(btn_row, text="Clear",
+                   command=self._sig_canvas.clear).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row, text="Undo Stroke",
+                   command=self._sig_canvas.undo_last_stroke).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row, text="Place Drawn Sig",
+                   command=self._activate_drawn_sig).pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(frame, text="Upload Signature Image…",
+                   command=self._upload_sig_image).pack(pady=(4, 2))
 
         ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
 
-        ttk.Label(frame, text="— OR type a signature —").pack(pady=4)
+        # ---- Typed signature ----
+        ttk.Label(frame, text="— OR type a signature —").pack(pady=2)
         self._typed_sig = tk.StringVar()
         ttk.Entry(frame, textvariable=self._typed_sig, width=28,
                   font=("Times New Roman", 16, "italic")).pack(pady=4)
+
+        font_row = ttk.Frame(frame)
+        font_row.pack(fill=tk.X, pady=2)
+        ttk.Label(font_row, text="Font:").pack(side=tk.LEFT)
+        ttk.Combobox(font_row, textvariable=self._typed_sig_font_var,
+                     values=list(_SIG_FONTS.keys()),
+                     state="readonly", width=22).pack(side=tk.LEFT, padx=4)
+
+        style_row = ttk.Frame(frame)
+        style_row.pack(fill=tk.X, pady=2)
+        ttk.Label(style_row, text="Size:").pack(side=tk.LEFT)
+        ttk.Spinbox(style_row, from_=8, to=72, textvariable=self._typed_sig_size,
+                    width=5).pack(side=tk.LEFT, padx=4)
+        self._typed_sig_color_btn = tk.Button(
+            style_row, text="  Colour  ", bg="#00007f", fg="white",
+            command=self._pick_typed_sig_color)
+        self._typed_sig_color_btn.pack(side=tk.LEFT, padx=6)
+
         ttk.Button(frame, text="Place Typed Signature",
                    command=self._activate_typed_sig).pack(pady=6)
+
+        ttk.Label(frame,
+                  text="Drag placed signatures to reposition.\nRight-click a signature to remove it.",
+                  foreground="gray", justify=tk.CENTER).pack(pady=2)
 
         self._sig_status = ttk.Label(frame, text="", foreground="green")
         self._sig_status.pack()
@@ -562,6 +700,9 @@ class PDFAssistantApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def _on_canvas_click(self, event):
+        # Suppress if a drag is in progress (started on an overlay item)
+        if self._dragging_id is not None:
+            return
         if not self._doc or self._page_count == 0:
             return
 
@@ -573,8 +714,6 @@ class PDFAssistantApp(tk.Tk):
         pdf_w = page.rect.width
         pdf_h = page.rect.height
 
-        # The preview image is rendered at PREVIEW_ZOOM; find image offset on canvas
-        # Image is placed at (10, 10) on canvas
         offset_x, offset_y = 10, 10
         img_x = canvas_x - offset_x
         img_y = canvas_y - offset_y
@@ -591,12 +730,8 @@ class PDFAssistantApp(tk.Tk):
         if self._text_placement_active:
             text = self._txt_input.get("1.0", tk.END).strip()
             self._doc.add_text(
-                self._current_page,
-                text,
-                pdf_x,
-                pdf_y,
-                font_size=self._txt_size.get(),
-                color=self._txt_color,
+                self._current_page, text, pdf_x, pdf_y,
+                font_size=self._txt_size.get(), color=self._txt_color,
             )
             self._text_placement_active = False
             self._page_canvas.config(cursor="")
@@ -604,23 +739,301 @@ class PDFAssistantApp(tk.Tk):
             self._refresh_preview()
 
         elif self._sig_placement_active:
+            ov_id = self._next_overlay_id
+            self._next_overlay_id += 1
+
             if self._pending_sig_img is not None:
-                # Drawn signature: 200px wide box in PDF coords
-                sig_w_pt = 150
-                sig_h_pt = 60
-                rect = (pdf_x, pdf_y - sig_h_pt, pdf_x + sig_w_pt, pdf_y)
-                self._doc.add_signature_image(self._current_page, self._pending_sig_img, rect)
+                sig_w_pt = 150.0
+                sig_h_pt = 60.0
+                overlay = {
+                    "id": ov_id,
+                    "type": "sig_image",
+                    "page": self._current_page,
+                    "pdf_x": pdf_x,
+                    "pdf_y": pdf_y - sig_h_pt,
+                    "pdf_w": sig_w_pt,
+                    "pdf_h": sig_h_pt,
+                    "data": self._pending_sig_img.copy(),
+                    "canvas_item": None,
+                }
             else:
-                # Typed signature
                 text = self._typed_sig.get().strip()
-                self._doc.add_signature_text(
-                    self._current_page, text, pdf_x, pdf_y, font_size=24
-                )
+                font_key = self._typed_sig_font_var.get()
+                fontname, fontfile = _SIG_FONTS.get(font_key, ("tiit", None))
+                overlay = {
+                    "id": ov_id,
+                    "type": "sig_text",
+                    "page": self._current_page,
+                    "pdf_x": pdf_x,
+                    "pdf_y": pdf_y,
+                    "pdf_w": 0.0,
+                    "pdf_h": 0.0,
+                    "data": text,
+                    "font_size": self._typed_sig_size.get(),
+                    "color": self._typed_sig_color,
+                    "fontname": fontname,
+                    "fontfile": fontfile,
+                    "canvas_item": None,
+                }
+
+            self._overlay_items.append(overlay)
             self._sig_placement_active = False
             self._pending_sig_img = None
             self._page_canvas.config(cursor="")
-            self._sig_status.config(text="Signature placed!")
-            self._refresh_preview()
+            self._sig_status.config(text="Placed! Drag to reposition, right-click to remove.")
+            self._add_overlay_to_canvas(overlay)
+
+        elif self._typewriter_active:
+            self._start_typewriter_entry(canvas_x, canvas_y, pdf_x, pdf_y)
+
+    # ------------------------------------------------------------------
+    # Signature pen controls
+    # ------------------------------------------------------------------
+
+    def _pick_sig_pen_color(self):
+        result = colorchooser.askcolor(color=self._sig_pen_color_hex,
+                                       title="Pick Pen Colour")
+        if result and result[1]:
+            self._sig_pen_color_hex = result[1]
+            r, g, b = result[0]
+            luma = 0.299 * r + 0.587 * g + 0.114 * b
+            fg = "white" if luma < 160 else "black"
+            self._sig_pen_color_btn.config(bg=result[1], fg=fg)
+            self._sig_canvas.set_pen_color(result[1])
+
+    def _update_pen_width(self):
+        try:
+            self._sig_canvas.set_pen_width(self._sig_pen_width.get())
+        except tk.TclError:
+            pass
+
+    def _pick_typed_sig_color(self):
+        init = "#{:02x}{:02x}{:02x}".format(
+            int(self._typed_sig_color[0] * 255),
+            int(self._typed_sig_color[1] * 255),
+            int(self._typed_sig_color[2] * 255),
+        )
+        result = colorchooser.askcolor(color=init, title="Pick Signature Colour")
+        if result and result[0]:
+            r, g, b = result[0]
+            self._typed_sig_color = (r / 255, g / 255, b / 255)
+            hex_color = result[1]
+            luma = 0.299 * r + 0.587 * g + 0.114 * b
+            fg = "white" if luma < 128 else "black"
+            self._typed_sig_color_btn.config(bg=hex_color, fg=fg)
+
+    # ------------------------------------------------------------------
+    # Upload signature image
+    # ------------------------------------------------------------------
+
+    def _upload_sig_image(self):
+        if not self._require_open():
+            return
+        path = filedialog.askopenfilename(
+            title="Open Signature Image",
+            filetypes=[
+                ("Image Files", "*.png *.jpg *.jpeg *.bmp *.gif"),
+                ("All Files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            img = Image.open(path).convert("RGBA")
+        except Exception as exc:
+            messagebox.showerror("Error", f"Cannot open image:\n{exc}")
+            return
+        self._pending_sig_img = img
+        self._sig_placement_active = True
+        self._text_placement_active = False
+        self._typewriter_active = False
+        self._sig_status.config(text="Click on the page to stamp the image.")
+        self._page_canvas.config(cursor="crosshair")
+
+    # ------------------------------------------------------------------
+    # Typewriter mode
+    # ------------------------------------------------------------------
+
+    def _activate_typewriter_mode(self):
+        if not self._require_open():
+            return
+        self._typewriter_active = True
+        self._text_placement_active = False
+        self._sig_placement_active = False
+        self._page_canvas.config(cursor="xterm")
+        self._txt_status.config(text="Typewriter ON \u2014 click page to type. Esc to stop.")
+
+    def _stop_typewriter_mode(self):
+        self._typewriter_active = False
+        self._page_canvas.config(cursor="")
+        self._txt_status.config(text="Typewriter stopped.")
+
+    def _start_typewriter_entry(self, canvas_x: float, canvas_y: float,
+                                pdf_x: float, pdf_y: float) -> None:
+        entry = tk.Entry(
+            self._page_canvas,
+            font=("Courier New", 12),
+            bd=1, relief=tk.SOLID,
+            highlightthickness=1,
+            highlightcolor="royalblue",
+            width=22,
+        )
+        win = self._page_canvas.create_window(
+            canvas_x, canvas_y, window=entry, anchor=tk.W)
+        entry.focus_set()
+
+        committed = [False]
+
+        def commit(e=None):
+            if committed[0]:
+                return
+            committed[0] = True
+            text = entry.get().strip()
+            entry.unbind("<FocusOut>")
+            self._page_canvas.delete(win)
+            entry.destroy()
+            if text:
+                self._doc.add_text(
+                    self._current_page, text, pdf_x, pdf_y,
+                    font_size=self._txt_size.get(),
+                    color=self._txt_color,
+                )
+                self._refresh_preview()
+
+        def cancel(e=None):
+            if committed[0]:
+                return
+            committed[0] = True
+            entry.unbind("<FocusOut>")
+            self._page_canvas.delete(win)
+            entry.destroy()
+            self._stop_typewriter_mode()
+
+        entry.bind("<Return>", commit)
+        entry.bind("<FocusOut>", commit)
+        entry.bind("<Escape>", cancel)
+
+    # ------------------------------------------------------------------
+    # Overlay canvas helpers
+    # ------------------------------------------------------------------
+
+    def _redraw_overlays(self) -> None:
+        """Re-draw all pending overlay items for the current page on the canvas."""
+        for ov in self._overlay_items:
+            if ov["page"] == self._current_page:
+                ov["canvas_item"] = None  # deleted by _refresh_preview's delete("all")
+                self._overlay_photo_refs.pop(ov["id"], None)
+                self._add_overlay_to_canvas(ov)
+
+    def _add_overlay_to_canvas(self, overlay: dict) -> None:
+        ov_id = overlay["id"]
+        tag = f"ov_{ov_id}"
+
+        cx = overlay["pdf_x"] * PREVIEW_ZOOM + 10
+        cy = overlay["pdf_y"] * PREVIEW_ZOOM + 10
+
+        if overlay["type"] == "sig_image":
+            disp_w = max(1, int(overlay["pdf_w"] * PREVIEW_ZOOM))
+            disp_h = max(1, int(overlay["pdf_h"] * PREVIEW_ZOOM))
+            disp_img = overlay["data"].resize((disp_w, disp_h), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(disp_img)
+            self._overlay_photo_refs[ov_id] = photo
+            item_id = self._page_canvas.create_image(
+                cx, cy, image=photo, anchor=tk.NW,
+                tags=("overlay", tag),
+            )
+        else:
+            r, g, b = overlay["color"]
+            hex_fill = "#{:02x}{:02x}{:02x}".format(
+                int(r * 255), int(g * 255), int(b * 255))
+            font_px = max(6, int(overlay["font_size"] * PREVIEW_ZOOM))
+            item_id = self._page_canvas.create_text(
+                cx, cy,
+                text=overlay["data"],
+                fill=hex_fill,
+                font=("Times New Roman", font_px, "italic"),
+                anchor=tk.SW,
+                tags=("overlay", tag),
+            )
+
+        overlay["canvas_item"] = item_id
+
+        # Bind drag to reposition
+        self._page_canvas.tag_bind(
+            tag, "<ButtonPress-1>",
+            lambda e, i=ov_id: self._start_drag(e, i),
+        )
+        # Right-click / secondary click to show remove menu
+        self._page_canvas.tag_bind(
+            tag, "<Button-2>",
+            lambda e, i=ov_id: self._remove_overlay_menu(e, i),
+        )
+        self._page_canvas.tag_bind(
+            tag, "<Button-3>",
+            lambda e, i=ov_id: self._remove_overlay_menu(e, i),
+        )
+
+    # ------------------------------------------------------------------
+    # Drag-to-reposition overlay
+    # ------------------------------------------------------------------
+
+    def _start_drag(self, event, overlay_id: int) -> str:
+        self._dragging_id = overlay_id
+        self._drag_last_canvas = (
+            self._page_canvas.canvasx(event.x),
+            self._page_canvas.canvasy(event.y),
+        )
+        return "break"  # stop propagation → _on_canvas_click won't fire
+
+    def _do_drag(self, event) -> None:
+        if self._dragging_id is None:
+            return
+        cx = self._page_canvas.canvasx(event.x)
+        cy = self._page_canvas.canvasy(event.y)
+        lx, ly = self._drag_last_canvas
+        dx, dy = cx - lx, cy - ly
+        for ov in self._overlay_items:
+            if ov["id"] == self._dragging_id and ov.get("canvas_item") is not None:
+                self._page_canvas.move(ov["canvas_item"], dx, dy)
+                break
+        self._drag_last_canvas = (cx, cy)
+
+    def _end_drag(self, event) -> None:
+        if self._dragging_id is None:
+            return
+        drag_id = self._dragging_id
+        self._dragging_id = None
+        self._drag_last_canvas = None
+        for ov in self._overlay_items:
+            if ov["id"] == drag_id and ov.get("canvas_item") is not None:
+                coords = self._page_canvas.coords(ov["canvas_item"])
+                if coords:
+                    cx, cy = coords[0], coords[1]
+                    ov["pdf_x"] = (cx - 10) / PREVIEW_ZOOM
+                    ov["pdf_y"] = (cy - 10) / PREVIEW_ZOOM
+                break
+
+    # ------------------------------------------------------------------
+    # Remove overlay
+    # ------------------------------------------------------------------
+
+    def _remove_overlay(self, overlay_id: int) -> None:
+        for i, ov in enumerate(self._overlay_items):
+            if ov["id"] == overlay_id:
+                if ov.get("canvas_item") is not None:
+                    self._page_canvas.delete(ov["canvas_item"])
+                self._overlay_photo_refs.pop(overlay_id, None)
+                self._overlay_items.pop(i)
+                break
+
+    def _remove_overlay_menu(self, event, overlay_id: int) -> None:
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Remove Signature",
+                         command=lambda: self._remove_overlay(overlay_id))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     # ------------------------------------------------------------------
     # File operations
@@ -644,6 +1057,8 @@ class PDFAssistantApp(tk.Tk):
 
     def _close_file(self):
         self._doc.close()
+        self._overlay_items.clear()
+        self._overlay_photo_refs.clear()
         self._page_count = 0
         self._current_page = 0
         self._page_canvas.delete("all")
@@ -677,6 +1092,7 @@ class PDFAssistantApp(tk.Tk):
 
         def worker():
             try:
+                self._doc.apply_pending_overlays(self._overlay_items)
                 if flatten:
                     self._doc.save_flattened(path, dpi=dpi,
                                              owner_password=owner_pw,
@@ -707,10 +1123,13 @@ class PDFAssistantApp(tk.Tk):
             self._save_status.config(text=f"Error: {error}", foreground="red")
             messagebox.showerror("Error saving file", error)
         else:
+            self._overlay_items.clear()
+            self._overlay_photo_refs.clear()
             self._save_status.config(
                 text=f"Saved ({mode})", foreground="green"
             )
             messagebox.showinfo("Saved", f"PDF saved ({mode}):\n{path}")
+            self._refresh_preview()
 
     # ------------------------------------------------------------------
     # Page navigation
@@ -748,6 +1167,7 @@ class PDFAssistantApp(tk.Tk):
             foreground="black",
         )
         self._split_to.set(self._page_count)
+        self._redraw_overlays()
 
     # ------------------------------------------------------------------
     # Guard
