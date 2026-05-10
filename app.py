@@ -195,6 +195,13 @@ class PDFAssistantApp(tk.Tk):
         # Typewriter mode
         self._typewriter_active: bool = False
 
+        # Draw mode (dark pen / eraser on page canvas)
+        self._draw_mode: str = ""          # "pen" | "eraser" | ""
+        self._draw_strokes: list = []      # [{mode, color, width, pts, page}]
+        self._draw_current_pts: list = []
+        self._draw_last: Optional[tuple] = None
+        self._draw_canvas_items: list = [] # canvas line ids for live feedback
+
         # Typed signature UI state (tk vars created before _build_ui)
         self._typed_sig_font_var = tk.StringVar(value=list(_SIG_FONTS.keys())[0])
         self._typed_sig_size = tk.IntVar(value=24)
@@ -253,6 +260,7 @@ class PDFAssistantApp(tk.Tk):
         self._build_watermark_tab()
         self._build_text_tab()
         self._build_signature_tab()
+        self._build_draw_tab()
         self._build_save_tab()
         self._build_split_tab()
 
@@ -279,6 +287,9 @@ class PDFAssistantApp(tk.Tk):
         self._page_canvas.bind("<Button-1>", self._on_canvas_click)
         self._page_canvas.bind("<B1-Motion>", self._do_drag)
         self._page_canvas.bind("<ButtonRelease-1>", self._end_drag)
+        self._page_canvas.bind("<ButtonPress-1>", self._draw_on_press, add="+")
+        self._page_canvas.bind("<B1-Motion>", self._draw_on_drag, add="+")
+        self._page_canvas.bind("<ButtonRelease-1>", self._draw_on_release, add="+")
 
     # ------------------------------------------------------------------
     # Watermark tab
@@ -559,6 +570,198 @@ class PDFAssistantApp(tk.Tk):
         self._text_placement_active = False
         self._sig_status.config(text="Click on the page to stamp typed signature.")
         self._page_canvas.config(cursor="crosshair")
+
+    # ------------------------------------------------------------------
+    # Draw tab  (dark pen + eraser directly on the page preview)
+    # ------------------------------------------------------------------
+
+    def _build_draw_tab(self):
+        frame = ttk.Frame(self._notebook, padding=10)
+        self._notebook.add(frame, text="Draw")
+
+        ttk.Label(frame, text="Draw directly on the page.\nDrag to paint; release to commit.",
+                  justify=tk.LEFT, foreground="gray").pack(anchor=tk.W, pady=(0, 8))
+
+        # Pen colour
+        self._draw_pen_color_hex: str = "#000000"
+        self._draw_pen_color_btn = tk.Button(
+            frame, text="  Pen Colour  ", bg="#000000", fg="white",
+            command=self._pick_draw_pen_color)
+        self._draw_pen_color_btn.pack(fill=tk.X, pady=2)
+
+        # Pen width
+        pw_row = ttk.Frame(frame)
+        pw_row.pack(fill=tk.X, pady=4)
+        ttk.Label(pw_row, text="Pen Width:").pack(side=tk.LEFT)
+        self._draw_pen_width = tk.IntVar(value=4)
+        ttk.Spinbox(pw_row, from_=1, to=30, textvariable=self._draw_pen_width,
+                    width=5).pack(side=tk.LEFT, padx=6)
+
+        ttk.Button(frame, text="✏  Dark Pen",
+                   command=self._activate_pen_mode).pack(fill=tk.X, pady=4)
+
+        ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+
+        # Eraser width
+        ew_row = ttk.Frame(frame)
+        ew_row.pack(fill=tk.X, pady=4)
+        ttk.Label(ew_row, text="Eraser Width:").pack(side=tk.LEFT)
+        self._draw_eraser_width = tk.IntVar(value=20)
+        ttk.Spinbox(ew_row, from_=5, to=80, textvariable=self._draw_eraser_width,
+                    width=5).pack(side=tk.LEFT, padx=6)
+
+        ttk.Button(frame, text="⬜  Eraser",
+                   command=self._activate_eraser_mode).pack(fill=tk.X, pady=4)
+
+        ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+
+        ttk.Button(frame, text="Undo Last Stroke",
+                   command=self._draw_undo).pack(fill=tk.X, pady=2)
+        ttk.Button(frame, text="Stop Drawing",
+                   command=self._stop_draw_mode).pack(fill=tk.X, pady=2)
+
+        self._draw_status = ttk.Label(frame, text="", foreground="green")
+        self._draw_status.pack(pady=6)
+
+    def _pick_draw_pen_color(self):
+        result = colorchooser.askcolor(color=self._draw_pen_color_hex,
+                                       title="Pick Pen Colour")
+        if result and result[1]:
+            self._draw_pen_color_hex = result[1]
+            r, g, b = result[0]
+            luma = 0.299 * r + 0.587 * g + 0.114 * b
+            fg = "white" if luma < 160 else "black"
+            self._draw_pen_color_btn.config(bg=result[1], fg=fg)
+
+    def _activate_pen_mode(self):
+        if not self._require_open():
+            return
+        self._draw_mode = "pen"
+        self._text_placement_active = False
+        self._sig_placement_active = False
+        self._typewriter_active = False
+        self._page_canvas.config(cursor="pencil")
+        self._draw_status.config(text="Pen active — drag on page.")
+
+    def _activate_eraser_mode(self):
+        if not self._require_open():
+            return
+        self._draw_mode = "eraser"
+        self._text_placement_active = False
+        self._sig_placement_active = False
+        self._typewriter_active = False
+        self._page_canvas.config(cursor="circle")
+        self._draw_status.config(text="Eraser active — drag on page.")
+
+    def _stop_draw_mode(self):
+        self._draw_mode = ""
+        self._page_canvas.config(cursor="")
+        self._draw_status.config(text="Draw mode stopped.")
+
+    # ---- draw event handlers (fire after existing press/drag/release) ----
+
+    def _draw_on_press(self, event):
+        if not self._draw_mode:
+            return
+        cx = self._page_canvas.canvasx(event.x)
+        cy = self._page_canvas.canvasy(event.y)
+        self._draw_last = (cx, cy)
+        self._draw_current_pts = [(cx, cy)]
+        self._draw_canvas_items = []
+
+    def _draw_on_drag(self, event):
+        if not self._draw_mode or self._draw_last is None:
+            return
+        cx = self._page_canvas.canvasx(event.x)
+        cy = self._page_canvas.canvasy(event.y)
+        x0, y0 = self._draw_last
+
+        if self._draw_mode == "pen":
+            color = self._draw_pen_color_hex
+            width = self._draw_pen_width.get()
+        else:
+            color = "#ffffff"
+            width = self._draw_eraser_width.get()
+
+        item = self._page_canvas.create_line(
+            x0, y0, cx, cy,
+            fill=color, width=width,
+            capstyle=tk.ROUND, joinstyle=tk.ROUND, smooth=True,
+            tags="draw_stroke",
+        )
+        self._draw_canvas_items.append(item)
+        self._draw_current_pts.append((cx, cy))
+        self._draw_last = (cx, cy)
+
+    def _draw_on_release(self, event):
+        if not self._draw_mode or len(self._draw_current_pts) < 2:
+            self._draw_last = None
+            self._draw_current_pts = []
+            return
+
+        if self._draw_mode == "pen":
+            color = self._draw_pen_color_hex
+            width = self._draw_pen_width.get()
+        else:
+            color = "#ffffff"
+            width = self._draw_eraser_width.get()
+
+        stroke = {
+            "mode": self._draw_mode,
+            "color": color,
+            "width": width,
+            "pts": list(self._draw_current_pts),
+            "page": self._current_page,
+            "canvas_items": list(self._draw_canvas_items),
+        }
+        self._draw_strokes.append(stroke)
+        self._draw_last = None
+        self._draw_current_pts = []
+        self._draw_canvas_items = []
+
+        # Burn stroke into the PDF page immediately
+        self._commit_draw_stroke(stroke)
+
+    def _commit_draw_stroke(self, stroke: dict):
+        """Convert canvas-coord stroke → PDF coords and burn into the page."""
+        page = self._doc._doc[stroke["page"]]
+        pdf_w = page.rect.width
+        pdf_h = page.rect.height
+        img_w = pdf_w * PREVIEW_ZOOM
+        img_h = pdf_h * PREVIEW_ZOOM
+        offset_x, offset_y = 10, 10
+
+        pdf_pts = []
+        for (cx, cy) in stroke["pts"]:
+            px = ((cx - offset_x) / img_w) * pdf_w
+            py = ((cy - offset_y) / img_h) * pdf_h
+            pdf_pts.append((px, py))
+
+        hex_c = stroke["color"].lstrip("#")
+        r = int(hex_c[0:2], 16) / 255
+        g = int(hex_c[2:4], 16) / 255
+        b = int(hex_c[4:6], 16) / 255
+
+        # Width in PDF points (scale back from preview zoom)
+        pdf_width = stroke["width"] / PREVIEW_ZOOM
+
+        self._doc.draw_stroke_on_page(stroke["page"], pdf_pts, (r, g, b), pdf_width)
+        self._refresh_preview()
+
+    def _draw_undo(self):
+        # Undo the last stroke by re-opening from the in-memory fitz doc is not
+        # straightforward, so we remove canvas items and inform the user that
+        # the PDF change requires a full re-render from source.  For a clean
+        # undo we reload from the last saved path (not yet implemented) or
+        # simply remove the visual and warn.
+        if not self._draw_strokes:
+            self._draw_status.config(text="Nothing to undo.")
+            return
+        stroke = self._draw_strokes.pop()
+        for item in stroke.get("canvas_items", []):
+            self._page_canvas.delete(item)
+        self._draw_status.config(
+            text="Visual removed. PDF stroke cannot be undone after burn-in.\nSave a copy before drawing to preserve originals.")
 
     # ------------------------------------------------------------------
     # Save tab
