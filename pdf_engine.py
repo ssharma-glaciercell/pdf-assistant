@@ -227,8 +227,55 @@ class PDFDocument:
         pdf_rect = fitz.Rect(*rect)
         page.insert_image(pdf_rect, stream=img_bytes, overlay=True)
 
-    def add_signature_text(
+    # ------------------------------------------------------------------
+    # Freehand draw stroke  (pen / eraser burned into content stream)
+    # ------------------------------------------------------------------
+
+    def draw_stroke_on_page(
         self,
+        page_index: int,
+        pts: list,          # [(x0,y0), (x1,y1), ...]  in PDF point coords
+        color: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+        width: float = 3.0,
+    ) -> None:
+        """
+        Draw a freehand polyline onto the page content stream using a PIL
+        overlay so it is burned in permanently (not a removable annotation).
+        An eraser stroke should pass color=(1,1,1) (white).
+        """
+        if not self._doc or len(pts) < 2:
+            return
+        page = self._doc[page_index]
+        pdf_w = page.rect.width
+        pdf_h = page.rect.height
+
+        # Render at 2× for quality then down-sample
+        scale = 2
+        img_w = int(pdf_w * scale)
+        img_h = int(pdf_h * scale)
+
+        overlay = Image.new("RGBA", (img_w, img_h), (255, 255, 255, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        r_i = int(color[0] * 255)
+        g_i = int(color[1] * 255)
+        b_i = int(color[2] * 255)
+        # Eraser is opaque white; pen is opaque colour
+        fill = (r_i, g_i, b_i, 255)
+        px_width = max(1, int(width * scale))
+
+        scaled = [(x * scale, y * scale) for (x, y) in pts]
+        draw.line(scaled, fill=fill, width=px_width, joint="curve")
+        # Draw round caps at each point
+        half = px_width // 2
+        for (x, y) in scaled:
+            draw.ellipse([x - half, y - half, x + half, y + half], fill=fill)
+
+        buf = io.BytesIO()
+        overlay.save(buf, "PNG")
+        page.insert_image(page.rect, stream=buf.getvalue(), overlay=True)
+
+    def add_signature_text(        self,
         page_index: int,
         text: str,
         x: float,
